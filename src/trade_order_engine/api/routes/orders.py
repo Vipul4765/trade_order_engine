@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 
 from trade_order_engine.api.dependencies import require_authorized_request
-from trade_order_engine.enums.order import OrderSide, OrderType
+from trade_order_engine.enums.order import OrderAction, OrderSide
 from trade_order_engine.exceptions import (
     OrderConflictError,
     OrderForbiddenError,
@@ -63,7 +63,7 @@ def place_order(payload: OrderCreateRequest, request: Request) -> OrderResponse:
         record.price,
         record.price_type.name,
     )
-    return OrderResponse.from_record(record)
+    return OrderResponse.from_record(record, action=OrderAction.PLACE)
 
 
 @router.post(
@@ -92,7 +92,7 @@ def place_orders_batch(
     )
     return OrderBatchResponse(
         count=len(records),
-        orders=[OrderResponse.from_record(record) for record in records],
+        orders=[OrderResponse.from_record(record, action=OrderAction.PLACE) for record in records],
     )
 
 
@@ -101,9 +101,9 @@ def list_orders(
     request: Request,
     stg_id: int | None = Query(default=None, gt=0, description="Filter by strategy ID (`STG_ID`)"),
     side: str | None = Query(default=None, description="Filter by side: 1/BUY or 2/SELL"),
-    order_type: str | None = Query(
+    action: str | None = Query(
         default=None,
-        description="Filter by ORDER_TYPE: L/PLACE, M/MODIFY, C/CANCEL",
+        description="Filter by lifecycle action: PLACE, MODIFY, CANCEL",
     ),
     limit: int | None = Query(default=None, gt=0, description="Maximum number of rows to return"),
 ) -> OrderListResponse:
@@ -115,23 +115,23 @@ def list_orders(
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
-    parsed_order_type: OrderType | None = None
-    if order_type is not None:
+    parsed_action: OrderAction | None = None
+    if action is not None:
         try:
-            parsed_order_type = OrderType.from_raw(order_type)
+            parsed_action = OrderAction.from_raw(action)
         except ValueError as exc:
             raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
     service = _get_order_service(request)
-    records = service.list_orders(
+    rows = service.list_orders(
         stg_id=stg_id,
         side=parsed_side,
-        order_type=parsed_order_type,
+        action=parsed_action,
         limit=limit,
     )
     return OrderListResponse(
-        count=len(records),
-        orders=[OrderResponse.from_record(record) for record in records],
+        count=len(rows),
+        orders=[OrderResponse.from_record(record, action=row_action) for record, row_action in rows],
     )
 
 
@@ -143,12 +143,12 @@ def get_order(
     """Return the latest recorded state for a single order by `uniq_no`."""
     service = _get_order_service(request)
     try:
-        record = service.get_order(uniq_no)
+        record, row_action = service.get_order(uniq_no)
     except OrderNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except OrderForbiddenError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-    return OrderResponse.from_record(record)
+    return OrderResponse.from_record(record, action=row_action)
 
 
 @router.patch("/{uniq_no}", response_model=OrderResponse)
@@ -157,7 +157,7 @@ def modify_order(
     request: Request,
     uniq_no: int = Path(..., gt=0, description="Unique order number (`UNIQ NO`) to modify"),
 ) -> OrderResponse:
-    """Validate and append a MODIFY (`ORDER_TYPE='M'`) row for an active order."""
+    """Modify an active order: keeps `uniq_no`, same `BUY/SELL` side, and `ORDER_TYPE='L'`."""
     service = _get_order_service(request)
     try:
         record = service.modify_order(uniq_no, payload)
@@ -171,14 +171,15 @@ def modify_order(
         raise HTTPException(status_code=_HTTP_422, detail=str(exc)) from exc
 
     logger.info(
-        "action=MODIFY ip=%s uniq_no=%s lot=%s price=%s price_type=%s",
+        "action=MODIFY ip=%s uniq_no=%s side=%s lot=%s price=%s price_type=%s",
         _client_ip(request),
         record.uniq_no,
+        record.side.name,
         record.lot,
         record.price,
         record.price_type.name,
     )
-    return OrderResponse.from_record(record)
+    return OrderResponse.from_record(record, action=OrderAction.MODIFY)
 
 
 @router.delete("/{uniq_no}", response_model=OrderResponse)
@@ -186,7 +187,7 @@ def cancel_order(
     request: Request,
     uniq_no: int = Path(..., gt=0, description="Unique order number (`UNIQ NO`) to cancel"),
 ) -> OrderResponse:
-    """Validate and append a CANCEL (`ORDER_TYPE='C'`) row for an active order."""
+    """Cancel an active order: keeps `uniq_no` & `ORDER_TYPE='L'`, flips `BUY/SELL` (`1 <-> 2`)."""
     service = _get_order_service(request)
     try:
         record = service.cancel_order(uniq_no)
@@ -198,9 +199,10 @@ def cancel_order(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     logger.info(
-        "action=CANCEL ip=%s uniq_no=%s contract=%s",
+        "action=CANCEL ip=%s uniq_no=%s flipped_side=%s contract=%s",
         _client_ip(request),
         record.uniq_no,
+        record.side.name,
         record.contract,
     )
-    return OrderResponse.from_record(record)
+    return OrderResponse.from_record(record, action=OrderAction.CANCEL)

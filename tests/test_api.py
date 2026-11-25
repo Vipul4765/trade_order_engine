@@ -86,7 +86,7 @@ class TestSingleOrderEndpoint:
             "price": "275.55",
             "price_type": "LIMIT",
             "order_type": "L",
-            "order_type_name": "PLACE",
+            "action": "PLACE",
             "stg_id": 763,
             "note": "leg1",
         }
@@ -402,13 +402,13 @@ class TestBatchAndListEndpoints:
 
 
 class TestModifyAndCancelLifecycle:
-    def test_place_modify_cancel_full_lifecycle_appends_exact_headerless_rows(
+    def test_place_modify_cancel_full_lifecycle_always_L_and_flips_side_on_cancel(
         self,
         tmp_path: Path,
     ) -> None:
         client, orderbook_path = _make_client(tmp_path)
 
-        # 1. Place Limit order (ORDER_TYPE='L')
+        # 1. Place SELL Limit order (ORDER_TYPE='L', side=2)
         place_resp = client.post(
             "/orders",
             json={
@@ -424,57 +424,91 @@ class TestModifyAndCancelLifecycle:
         )
         assert place_resp.status_code == 201
         assert place_resp.json()["order_type"] == "L"
-        assert place_resp.json()["order_type_name"] == "PLACE"
+        assert place_resp.json()["action"] == "PLACE"
+        assert place_resp.json()["side"] == 2
 
-        # 2. Modify lot & price (ORDER_TYPE='M')
+        # 2. Modify price (same uniq_no=676, same side=2, ORDER_TYPE still 'L')
         mod1_resp = client.patch(
             "/orders/676",
             json={"lot": 10, "price": "276.25"},
         )
         assert mod1_resp.status_code == 200
         mod1_body = mod1_resp.json()
-        assert mod1_body["order_type"] == "M"
-        assert mod1_body["order_type_name"] == "MODIFY"
+        assert mod1_body["order_type"] == "L"
+        assert mod1_body["action"] == "MODIFY"
+        assert mod1_body["side"] == 2
         assert mod1_body["lot"] == 10
         assert _INTERNAL_CLIENT_ID not in mod1_resp.text
 
-        # 3. Second modify changes price & note (keeps lot=10 from latest state)
+        # 3. Second modify changes price & note (still same uniq_no, same side=2, ORDER_TYPE='L')
         mod2_resp = client.patch("/orders/676", json={"price": "277.00", "note": "repriced"})
         assert mod2_resp.status_code == 200
         assert mod2_resp.json()["price"] == "277.00"
-        assert mod2_resp.json()["note"] == "repriced"
+        assert mod2_resp.json()["order_type"] == "L"
+        assert mod2_resp.json()["side"] == 2
 
         # GET /orders/676 returns latest modified state without exposing client_id
         get_resp = client.get("/orders/676")
         assert get_resp.status_code == 200
         assert get_resp.json()["price"] == "277.00"
-        assert get_resp.json()["order_type"] == "M"
+        assert get_resp.json()["order_type"] == "L"
+        assert get_resp.json()["action"] == "MODIFY"
         assert _INTERNAL_CLIENT_ID not in get_resp.text
 
-        # 4. Cancel order (ORDER_TYPE='C'), carrying forward latest modified values
+        # 4. Cancel SELL order -> flips side 2 -> 1 (BUY), keeps ORDER_TYPE='L' and all other fields
         cancel_resp = client.delete("/orders/676")
         assert cancel_resp.status_code == 200
         cancel_body = cancel_resp.json()
-        assert cancel_body["order_type"] == "C"
-        assert cancel_body["order_type_name"] == "CANCEL"
+        assert cancel_body["order_type"] == "L"
+        assert cancel_body["action"] == "CANCEL"
+        assert cancel_body["side"] == 1
+        assert cancel_body["side_name"] == "BUY"
         assert _INTERNAL_CLIENT_ID not in cancel_resp.text
 
-        # Verify exact headerless .txt contents: UNIQ NO,CONTRACT,BUY/SELL,LOT,PRICE,ORDER_TYPE,ID,STG_ID,NOTE
+        # Also test BUY -> CANCEL flips side 1 -> 2 (SELL) with ORDER_TYPE='L'
+        assert (
+            client.post(
+                "/orders",
+                json={
+                    "uniq_no": 700,
+                    "contract": "NIFTY2690823850PE",
+                    "side": 1,
+                    "lot": 3,
+                    "price_type": "LIMIT",
+                    "price": "150.00",
+                    "stg_id": 763,
+                    "note": "buy-leg",
+                },
+            ).status_code
+            == 201
+        )
+        buy_cancel = client.delete("/orders/700")
+        assert buy_cancel.status_code == 200
+        assert buy_cancel.json()["side"] == 2
+        assert buy_cancel.json()["side_name"] == "SELL"
+        assert buy_cancel.json()["order_type"] == "L"
+        assert buy_cancel.json()["action"] == "CANCEL"
+
+        # Verify exact headerless .txt contents (ORDER_TYPE is ALWAYS 'L'!)
         assert orderbook_path.read_text(encoding="utf-8").splitlines() == [
             f"676,NIFTY2690823850CE,2,5,275.55,L,{_INTERNAL_CLIENT_ID},763,init",
-            f"676,NIFTY2690823850CE,2,10,276.25,M,{_INTERNAL_CLIENT_ID},763,init",
-            f"676,NIFTY2690823850CE,2,10,277.00,M,{_INTERNAL_CLIENT_ID},763,repriced",
-            f"676,NIFTY2690823850CE,2,10,277.00,C,{_INTERNAL_CLIENT_ID},763,repriced",
+            f"676,NIFTY2690823850CE,2,10,276.25,L,{_INTERNAL_CLIENT_ID},763,init",
+            f"676,NIFTY2690823850CE,2,10,277.00,L,{_INTERNAL_CLIENT_ID},763,repriced",
+            f"676,NIFTY2690823850CE,1,10,277.00,L,{_INTERNAL_CLIENT_ID},763,repriced",
+            f"700,NIFTY2690823850PE,1,3,150.00,L,{_INTERNAL_CLIENT_ID},763,buy-leg",
+            f"700,NIFTY2690823850PE,2,3,150.00,L,{_INTERNAL_CLIENT_ID},763,buy-leg",
         ]
 
-        # Filter by order_type in GET /orders
-        assert client.get("/orders", params={"order_type": "M"}).json()["count"] == 2
-        assert client.get("/orders", params={"order_type": "CANCEL"}).json()["count"] == 1
+        # Filter by lifecycle action in GET /orders
+        assert client.get("/orders", params={"action": "PLACE"}).json()["count"] == 2
+        assert client.get("/orders", params={"action": "MODIFY"}).json()["count"] == 2
+        assert client.get("/orders", params={"action": "CANCEL"}).json()["count"] == 2
 
         # 5. Further modify or cancel after cancellation returns 409 Conflict
         assert client.patch("/orders/676", json={"price": "278.00"}).status_code == 409
         assert client.delete("/orders/676").status_code == 409
-        assert len(orderbook_path.read_text(encoding="utf-8").splitlines()) == 4
+        assert client.delete("/orders/700").status_code == 409
+        assert len(orderbook_path.read_text(encoding="utf-8").splitlines()) == 6
 
     def test_modify_cancel_get_nonexistent_order_returns_404_without_creating_file(
         self,
@@ -527,12 +561,13 @@ class TestModifyAndCancelLifecycle:
         # Trying to set nonzero price while staying MARKET rejected with 422
         assert client.patch("/orders/500", json={"price": "105.50"}).status_code == 422
 
-        # Switching MARKET to LIMIT WITH positive price succeeds (ORDER_TYPE='M')
+        # Switching MARKET to LIMIT WITH positive price succeeds (ORDER_TYPE stays 'L')
         good_mod = client.patch("/orders/500", json={"price_type": "LIMIT", "price": "105.50"})
         assert good_mod.status_code == 200
         assert good_mod.json()["price_type"] == "LIMIT"
         assert good_mod.json()["price"] == "105.50"
-        assert good_mod.json()["order_type"] == "M"
+        assert good_mod.json()["order_type"] == "L"
+        assert good_mod.json()["action"] == "MODIFY"
 
         # Switching LIMIT back to MARKET with nonzero price fails 422; without price resets price to 0
         assert client.patch("/orders/500", json={"price_type": "MARKET", "price": "105.50"}).status_code == 422
@@ -540,10 +575,11 @@ class TestModifyAndCancelLifecycle:
         assert back_to_mkt.status_code == 200
         assert back_to_mkt.json()["price_type"] == "MARKET"
         assert back_to_mkt.json()["price"] == "0"
-        assert back_to_mkt.json()["order_type"] == "M"
+        assert back_to_mkt.json()["order_type"] == "L"
+        assert back_to_mkt.json()["action"] == "MODIFY"
 
         assert orderbook_path.read_text(encoding="utf-8").splitlines() == [
             f"500,NIFTY2690823850CE,1,1,0,L,{_INTERNAL_CLIENT_ID},50,",
-            f"500,NIFTY2690823850CE,1,1,105.50,M,{_INTERNAL_CLIENT_ID},50,",
-            f"500,NIFTY2690823850CE,1,1,0,M,{_INTERNAL_CLIENT_ID},50,",
+            f"500,NIFTY2690823850CE,1,1,105.50,L,{_INTERNAL_CLIENT_ID},50,",
+            f"500,NIFTY2690823850CE,1,1,0,L,{_INTERNAL_CLIENT_ID},50,",
         ]

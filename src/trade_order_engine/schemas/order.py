@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from trade_order_engine.enums.order import OrderSide, OrderType, PriceType
+from trade_order_engine.enums.order import OrderAction, OrderSide, OrderType, PriceType
 from trade_order_engine.models.contract import Contract
 from trade_order_engine.models.order import OrderRecord
 
@@ -162,7 +162,7 @@ class OrderBatchCreateRequest(BaseModel):
 
 
 class OrderModifyRequest(BaseModel):
-    """Payload to modify an existing active order by `uniq_no` (`ORDER_TYPE = 'M'`)."""
+    """Payload to modify an active order by `uniq_no` (keeps `ORDER_TYPE = 'L'` and same side)."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -245,12 +245,17 @@ class OrderResponse(BaseModel):
     price: Decimal
     price_type: PriceType
     order_type: OrderType
-    order_type_name: str
+    action: OrderAction
     stg_id: int
     note: str
 
     @classmethod
-    def from_record(cls, record: OrderRecord) -> OrderResponse:
+    def from_record(
+        cls,
+        record: OrderRecord,
+        *,
+        action: OrderAction = OrderAction.PLACE,
+    ) -> OrderResponse:
         return cls(
             uniq_no=record.uniq_no,
             contract=record.contract,
@@ -261,7 +266,7 @@ class OrderResponse(BaseModel):
             price=record.price,
             price_type=record.price_type,
             order_type=record.order_type,
-            order_type_name=record.order_type.name,
+            action=action,
             stg_id=record.stg_id,
             note=record.note,
         )

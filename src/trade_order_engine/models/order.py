@@ -20,11 +20,11 @@ class OrderRecord:
     Column order:
         UNIQ NO,CONTRACT,BUY/SELL,LOT,PRICE,ORDER_TYPE,ID,STG_ID,NOTE
 
-    Examples:
+    Examples (ORDER_TYPE is always 'L'):
         Market place: 676,NIFTY2690823850CE,2,5,0,L,CLIENT01,763,275.55
         Limit place:  677,NIFTY2690823850CE,2,5,275.55,L,CLIENT01,763,
-        Modify:       677,NIFTY2690823850CE,2,10,276.25,M,CLIENT01,763,
-        Cancel:       677,NIFTY2690823850CE,2,10,276.25,C,CLIENT01,763,
+        Modify:       677,NIFTY2690823850CE,2,5,276.25,L,CLIENT01,763,
+        Cancel:       677,NIFTY2690823850CE,1,5,276.25,L,CLIENT01,763,
     """
 
     uniq_no: int

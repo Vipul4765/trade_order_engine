@@ -6,11 +6,11 @@ A Python + FastAPI order engine providing strongly typed trading enums, option c
 
 - **Exact 9-Field Headerless `.txt` Format**:
   `UNIQ NO,CONTRACT,BUY/SELL,LOT,PRICE,ORDER_TYPE,ID,STG_ID,NOTE` (data rows only, no header line written).
-- **Limit & Market Rules**:
-  - **Limit order**: `PRICE > 0`, writes `ORDER_TYPE = "L"`.
-  - **Market order**: `PRICE = 0`, **also writes `ORDER_TYPE = "L"`**.
-  - **Modify**: writes `ORDER_TYPE = "M"`.
-  - **Cancel**: writes `ORDER_TYPE = "C"`.
+- **Wire Rules (`ORDER_TYPE` is ALWAYS `"L"`)**:
+  - **Place Limit**: `ORDER_TYPE = "L"`, `PRICE > 0`.
+  - **Place Market**: `ORDER_TYPE = "L"`, `PRICE = 0`.
+  - **Modify**: keeps the **same `UNIQ NO`**, **same `BUY/SELL` side**, and `ORDER_TYPE = "L"`, updating `PRICE` (and optional `LOT`/`NOTE`).
+  - **Cancel**: keeps the **same `UNIQ NO`** and `ORDER_TYPE = "L"`, **flipping `BUY/SELL`** (`1 → 2` for BUY, `2 → 1` for SELL) while keeping all other fields the same.
 - **Strictly Internal `ID` (`client_id`)**: Configured server-side via `ORDER_CLIENT_ID` and injected internally into `.txt` rows — never accepted in public API requests and never exposed in API responses.
 - **Validated Order Lifecycle API**:
   - **Place** single (`POST /orders`) or multi-leg atomic batches (`POST /orders/batch`)
@@ -72,8 +72,9 @@ trade_order_engine/
 
 | Enum | Values |
 | :--- | :--- |
-| `OrderSide` | `BUY = 1`, `SELL = 2` |
-| `OrderType` | `PLACE = "L"` (Limit & Market), `MODIFY = "M"`, `CANCEL = "C"` |
+| `OrderSide` | `BUY = 1`, `SELL = 2` (`.opposite` flips `1 ↔ 2` on cancel) |
+| `OrderType` | `LIMIT = "L"` (always `"L"` in `.txt` column 6) |
+| `OrderAction` | `PLACE`, `MODIFY`, `CANCEL` (lifecycle state derived from `UNIQ NO` & `BUY/SELL`) |
 | `PriceType` | `LIMIT` (`PRICE > 0`, `ORDER_TYPE = "L"`), `MARKET` (`PRICE = 0`, `ORDER_TYPE = "L"`) |
 | `OptionType` | `CALL = "CE"` (`CE`), `PUT = "PE"` (`PE`) |
 | `InstrumentType` | `OPTION = "OPT"`, `FUTURE = "FUT"`, `EQUITY = "EQ"` |
@@ -83,16 +84,16 @@ trade_order_engine/
 
 ## OrderBook `.txt` Format (Headerless, 9 Fields)
 
-Column order: `UNIQ NO,CONTRACT,BUY/SELL,LOT,PRICE,ORDER_TYPE,ID,STG_ID,NOTE` (no header line written; server injects internal `ORDER_CLIENT_ID` into column 7):
+Column order: `UNIQ NO,CONTRACT,BUY/SELL,LOT,PRICE,ORDER_TYPE,ID,STG_ID,NOTE` (no header line written; `ORDER_TYPE` is always `L`; server injects internal `ORDER_CLIENT_ID` into column 7):
 
 ```text
 # Place Market order (PRICE = 0, ORDER_TYPE = L)
 676,NIFTY2690823850CE,2,5,0,L,<INTERNAL_ID>,763,275.55
 
-# Place Limit order -> Modify -> Cancel
-677,NIFTY2690823850CE,2,5,275.55,L,<INTERNAL_ID>,763,entry
-677,NIFTY2690823850CE,2,10,276.25,M,<INTERNAL_ID>,763,entry
-677,NIFTY2690823850CE,2,10,276.25,C,<INTERNAL_ID>,763,entry
+# Place Limit (BUY=1) -> Modify price (same UNIQ NO & side=1) -> Cancel (flips side 1 -> 2)
+677,NIFTY2690823850CE,1,5,275.55,L,<INTERNAL_ID>,763,entry
+677,NIFTY2690823850CE,1,5,276.25,L,<INTERNAL_ID>,763,entry
+677,NIFTY2690823850CE,2,5,276.25,L,<INTERNAL_ID>,763,entry
 ```
 
 ## Quick Start & Hosting Security
@@ -150,10 +151,10 @@ uvicorn trade_order_engine.api.app:app --host 127.0.0.1 --port 8000
 | `GET` | `/health` | IP/Rate | Minimal liveness check (`{"status": "ok"}`) |
 | `POST` | `/orders` | Required | Validate and place a single order (`ORDER_TYPE = 'L'`) |
 | `POST` | `/orders/batch` | Required | Validate and write multiple legs atomically (`ORDER_TYPE = 'L'`) |
-| `GET` | `/orders` | Required | List rows (filter by `stg_id`, `side`, `order_type`, `limit`) |
+| `GET` | `/orders` | Required | List rows (filter by `stg_id`, `side`, `action`, `limit`) |
 | `GET` | `/orders/{uniq_no}` | Required | Fetch latest state of an order by `uniq_no` |
-| `PATCH` | `/orders/{uniq_no}` | Required | Validate and append a modify row (`ORDER_TYPE = 'M'`) |
-| `DELETE` | `/orders/{uniq_no}` | Required | Validate and append a cancel row (`ORDER_TYPE = 'C'`) |
+| `PATCH` | `/orders/{uniq_no}` | Required | Modify active order: same `uniq_no` & side, updated price, `ORDER_TYPE = 'L'` |
+| `DELETE` | `/orders/{uniq_no}` | Required | Cancel active order: same `uniq_no`, flipped `BUY/SELL` (`1 ↔ 2`), `ORDER_TYPE = 'L'` |
 
 ### Example `curl` Requests
 
@@ -191,15 +192,15 @@ curl -X POST https://your-host/orders \
   }'
 ```
 
-**Modify an active order (`ORDER_TYPE = "M"`):**
+**Modify an active order (same `uniq_no` & side, updated price, `ORDER_TYPE = "L"`):**
 ```bash
 curl -X PATCH https://your-host/orders/677 \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $ORDER_API_KEY" \
-  -d '{"lot": 10, "price": "276.25"}'
+  -d '{"price": "276.25"}'
 ```
 
-**Cancel an active order (`ORDER_TYPE = "C"`):**
+**Cancel an active order (same `uniq_no`, flips `BUY/SELL` `1 ↔ 2`, `ORDER_TYPE = "L"`):**
 ```bash
 curl -X DELETE https://your-host/orders/677 \
   -H "X-API-Key: $ORDER_API_KEY"

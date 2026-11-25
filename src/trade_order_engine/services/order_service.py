@@ -1,4 +1,10 @@
-"""Order lifecycle service: place, modify, cancel, query, and `.txt` persistence."""
+"""Order lifecycle service: place, modify, cancel, query, and `.txt` persistence.
+
+Wire rules for `.txt` rows (9 fields, headerless):
+- `ORDER_TYPE` (col 6) is ALWAYS `'L'` (Limit: `PRICE > 0`, Market: `PRICE = 0`)
+- Modify keeps the same `UNIQ NO`, same `BUY/SELL` side, and `'L'`, updating `PRICE` (and optional `LOT`/`NOTE`)
+- Cancel keeps the same `UNIQ NO` and `'L'`, flipping `BUY/SELL` (`1 <-> 2`)
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,7 @@ import secrets
 from collections.abc import Callable
 from decimal import Decimal
 
-from trade_order_engine.enums.order import OrderSide, OrderType, PriceType
+from trade_order_engine.enums.order import OrderAction, OrderSide, OrderType, PriceType
 from trade_order_engine.exceptions import (
     DuplicateOrderError,
     OrderAlreadyCancelledError,
@@ -31,6 +37,21 @@ def _default_uniq_no() -> int:
 def _default_stg_id() -> int:
     """Generate a positive strategy ID (1..99999)."""
     return secrets.randbelow(99_999) + 1
+
+
+def _classify_history(records: list[OrderRecord]) -> list[tuple[OrderRecord, OrderAction]]:
+    """Derive `(record, OrderAction)` for each append-only row using `uniq_no` and `side`."""
+    initial_side: dict[int, OrderSide] = {}
+    classified: list[tuple[OrderRecord, OrderAction]] = []
+    for record in records:
+        if record.uniq_no not in initial_side:
+            initial_side[record.uniq_no] = record.side
+            classified.append((record, OrderAction.PLACE))
+        elif record.side is initial_side[record.uniq_no]:
+            classified.append((record, OrderAction.MODIFY))
+        else:
+            classified.append((record, OrderAction.CANCEL))
+    return classified
 
 
 class OrderService:
@@ -100,12 +121,12 @@ class OrderService:
         return self.store.transact_append(_build)
 
     def modify_order(self, uniq_no: int, request: OrderModifyRequest) -> OrderRecord:
-        """Validate that `uniq_no` exists and is active, then append an `ORDER_TYPE='M'` row."""
+        """Keep the same `uniq_no`, same `side`, and `ORDER_TYPE='L'`; update price/lot/note."""
 
         def _build(existing: list[OrderRecord]) -> list[OrderRecord]:
-            latest = self._find_latest_by_uniq_no(existing, uniq_no)
+            first, latest = self._find_first_and_latest(existing, uniq_no)
             self._assert_owned_by_internal_client(latest)
-            if latest.order_type is OrderType.CANCEL:
+            if latest.side is not first.side:
                 raise OrderAlreadyCancelledError(
                     f"Order uniq_no={uniq_no} is already cancelled and cannot be modified"
                 )
@@ -133,7 +154,7 @@ class OrderService:
                 side=latest.side,
                 lot=new_lot,
                 price=new_price,
-                order_type=OrderType.MODIFY,
+                order_type=OrderType.LIMIT,
                 client_id=latest.client_id,
                 stg_id=latest.stg_id,
                 note=new_note,
@@ -144,12 +165,12 @@ class OrderService:
         return written[0]
 
     def cancel_order(self, uniq_no: int) -> OrderRecord:
-        """Validate that `uniq_no` exists and is active, then append an `ORDER_TYPE='C'` row."""
+        """Keep `uniq_no`, `ORDER_TYPE='L'`, and other fields; flip `BUY/SELL` (`1 <-> 2`)."""
 
         def _build(existing: list[OrderRecord]) -> list[OrderRecord]:
-            latest = self._find_latest_by_uniq_no(existing, uniq_no)
+            first, latest = self._find_first_and_latest(existing, uniq_no)
             self._assert_owned_by_internal_client(latest)
-            if latest.order_type is OrderType.CANCEL:
+            if latest.side is not first.side:
                 raise OrderAlreadyCancelledError(
                     f"Order uniq_no={uniq_no} is already cancelled"
                 )
@@ -157,10 +178,10 @@ class OrderService:
             cancelled = OrderRecord(
                 uniq_no=latest.uniq_no,
                 contract=latest.contract,
-                side=latest.side,
+                side=latest.side.opposite,
                 lot=latest.lot,
                 price=latest.price,
-                order_type=OrderType.CANCEL,
+                order_type=OrderType.LIMIT,
                 client_id=latest.client_id,
                 stg_id=latest.stg_id,
                 note=latest.note,
@@ -170,45 +191,59 @@ class OrderService:
         written = self.store.transact_append(_build)
         return written[0]
 
-    def get_order(self, uniq_no: int) -> OrderRecord:
-        """Return the latest recorded state for `uniq_no`, or raise `OrderNotFoundError`."""
+    def get_order(self, uniq_no: int) -> tuple[OrderRecord, OrderAction]:
+        """Return `(latest_record, OrderAction)` for `uniq_no`, or raise `OrderNotFoundError`."""
         existing = self.store.read_all()
-        latest = self._find_latest_by_uniq_no(existing, uniq_no)
+        first, latest = self._find_first_and_latest(existing, uniq_no)
         self._assert_owned_by_internal_client(latest)
-        return latest
+        matching_count = sum(1 for row in existing if row.uniq_no == uniq_no)
+        if latest.side is not first.side:
+            action = OrderAction.CANCEL
+        elif matching_count > 1:
+            action = OrderAction.MODIFY
+        else:
+            action = OrderAction.PLACE
+        return latest, action
 
     def list_orders(
         self,
         *,
         stg_id: int | None = None,
         side: OrderSide | None = None,
-        order_type: OrderType | None = None,
+        action: OrderAction | None = None,
         limit: int | None = None,
-    ) -> list[OrderRecord]:
-        """Read stored order rows belonging to the configured internal `client_id`."""
+    ) -> list[tuple[OrderRecord, OrderAction]]:
+        """Read stored `(record, action)` rows belonging to the internal `client_id`."""
         internal_client_id = self._require_internal_client_id()
-        orders = [o for o in self.store.read_all() if o.client_id == internal_client_id]
+        owned_records = [o for o in self.store.read_all() if o.client_id == internal_client_id]
+        classified = _classify_history(owned_records)
 
         if stg_id is not None:
-            orders = [o for o in orders if o.stg_id == stg_id]
+            classified = [(r, a) for r, a in classified if r.stg_id == stg_id]
         if side is not None:
-            orders = [o for o in orders if o.side is side]
-        if order_type is not None:
-            orders = [o for o in orders if o.order_type is order_type]
+            classified = [(r, a) for r, a in classified if r.side is side]
+        if action is not None:
+            classified = [(r, a) for r, a in classified if a is action]
         if limit is not None:
-            orders = orders[:limit]
+            classified = classified[:limit]
 
-        return orders
+        return classified
 
-    def _find_latest_by_uniq_no(
+    def _find_first_and_latest(
         self,
         records: list[OrderRecord],
         uniq_no: int,
-    ) -> OrderRecord:
-        for record in reversed(records):
+    ) -> tuple[OrderRecord, OrderRecord]:
+        first: OrderRecord | None = None
+        latest: OrderRecord | None = None
+        for record in records:
             if record.uniq_no == uniq_no:
-                return record
-        raise OrderNotFoundError(f"Order with uniq_no={uniq_no} not found")
+                if first is None:
+                    first = record
+                latest = record
+        if first is None or latest is None:
+            raise OrderNotFoundError(f"Order with uniq_no={uniq_no} not found")
+        return first, latest
 
     def _generate_unique_uniq_no(self, used_uniq_nos: set[int]) -> int:
         for _ in range(100):
@@ -247,7 +282,7 @@ class OrderService:
             side=request.side,
             lot=request.lot,
             price=request.price,
-            order_type=request.price_type.txt_order_type,
+            order_type=OrderType.LIMIT,
             client_id=client_id,
             stg_id=stg_id,
             note=request.note,

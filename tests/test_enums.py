@@ -8,6 +8,7 @@ from trade_order_engine import (
     BookType,
     InstrumentType,
     OptionType,
+    OrderAction,
     OrderBookColumn,
     OrderSide,
     OrderType,
@@ -17,11 +18,13 @@ from trade_order_engine import (
 
 
 class TestOrderSide:
-    def test_values_and_sign(self) -> None:
+    def test_values_sign_and_opposite(self) -> None:
         assert OrderSide.BUY == 1
         assert OrderSide.SELL == 2
         assert OrderSide.BUY.sign == 1
         assert OrderSide.SELL.sign == -1
+        assert OrderSide.BUY.opposite is OrderSide.SELL
+        assert OrderSide.SELL.opposite is OrderSide.BUY
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
@@ -47,38 +50,27 @@ class TestOrderSide:
             OrderSide.from_raw(raw)  # type: ignore[arg-type]
 
 
-class TestOrderType:
-    def test_values_and_str(self) -> None:
-        assert tuple(OrderType) == (OrderType.PLACE, OrderType.MODIFY, OrderType.CANCEL)
-        assert OrderType.PLACE == "L"
-        assert OrderType.MODIFY == "M"
-        assert OrderType.CANCEL == "C"
-        assert str(OrderType.PLACE) == "L"
-        assert str(OrderType.MODIFY) == "M"
-        assert str(OrderType.CANCEL) == "C"
+class TestOrderTypeAndAction:
+    def test_order_type_is_always_L(self) -> None:
+        assert tuple(OrderType) == (OrderType.LIMIT,)
+        assert OrderType.LIMIT == "L"
+        assert OrderType.L is OrderType.LIMIT
+        assert str(OrderType.LIMIT) == "L"
+        assert OrderType.from_raw("l") is OrderType.LIMIT
+        assert OrderType.from_raw("LIMIT") is OrderType.LIMIT
 
-    @pytest.mark.parametrize(
-        ("raw", "expected"),
-        [
-            ("L", OrderType.PLACE),
-            (" l ", OrderType.PLACE),
-            ("place", OrderType.PLACE),
-            ("M", OrderType.MODIFY),
-            ("mod", OrderType.MODIFY),
-            ("MODIFY", OrderType.MODIFY),
-            ("C", OrderType.CANCEL),
-            ("can", OrderType.CANCEL),
-            ("cancel", OrderType.CANCEL),
-            (OrderType.PLACE, OrderType.PLACE),
-        ],
-    )
-    def test_from_raw_valid(self, raw: str | OrderType, expected: OrderType) -> None:
-        assert OrderType.from_raw(raw) is expected
-
-    @pytest.mark.parametrize("raw", ["0", "1", "2", "SL", "SLM", "X", "", 0])
-    def test_from_raw_invalid(self, raw: object) -> None:
+    @pytest.mark.parametrize("raw", ["M", "C", "SL", "SLM", "0", "", 0])
+    def test_order_type_rejects_non_L(self, raw: object) -> None:
         with pytest.raises(ValueError):
             OrderType.from_raw(raw)  # type: ignore[arg-type]
+
+    def test_order_action_parsing(self) -> None:
+        assert tuple(OrderAction) == (OrderAction.PLACE, OrderAction.MODIFY, OrderAction.CANCEL)
+        assert OrderAction.from_raw("place") is OrderAction.PLACE
+        assert OrderAction.from_raw("MODIFY") is OrderAction.MODIFY
+        assert OrderAction.from_raw("cancel") is OrderAction.CANCEL
+        with pytest.raises(ValueError):
+            OrderAction.from_raw("UNKNOWN")
 
 
 class TestPriceType:
@@ -86,8 +78,8 @@ class TestPriceType:
         assert tuple(PriceType) == (PriceType.LIMIT, PriceType.MARKET)
         assert PriceType.LIMIT == "LIMIT"
         assert PriceType.MARKET == "MARKET"
-        assert PriceType.LIMIT.txt_order_type is OrderType.PLACE
-        assert PriceType.MARKET.txt_order_type is OrderType.PLACE
+        assert PriceType.LIMIT.txt_order_type is OrderType.LIMIT
+        assert PriceType.MARKET.txt_order_type is OrderType.LIMIT
         assert str(PriceType.LIMIT.txt_order_type) == "L"
         assert str(PriceType.MARKET.txt_order_type) == "L"
 
